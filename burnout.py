@@ -53,6 +53,7 @@ from rothermel import HEAT_CONTENT, FuelModel, Moisture
 # ---------------------------------------------------------------------------
 LB_PER_FT2_TO_KG_PER_M2 = 4.882428      # 1 lb/ft^2 -> kg/m^2
 BTU_PER_LB_TO_J_PER_KG = 2326.0         # 1 BTU/lb  -> J/kg
+IR_BTUFT2MIN_TO_WM2 = 189.266           # 1 BTU/ft^2/min -> W/m^2  (J/m^2/s)
 LATENT_HEAT_WATER = 2.26e6              # latent heat of vaporisation [J/kg]
 
 # low heat content of all FBFM40 classes, in SI
@@ -138,8 +139,24 @@ def compute_burnout(
     t_f: float | None = None,
     wrf_weight: float | None = None,
     consumed_load: float | None = None,
+    reaction_intensity: float | None = None,
 ) -> BurnoutResult:
     """Build the fuel mass-loss heat-release for one fuel model and condition.
+
+    Two energy bases are available for the flaming heat release per unit area:
+
+    * **I_R-consistent** (when ``reaction_intensity`` is given): the heat per
+      unit area is Byram's ``HPA = I_R * t_r``, so the peak total flux
+      ``E_gross / T_f`` is exactly the Rothermel reaction intensity ``I_R``.
+      Because ``I_R`` already carries Rothermel's moisture and mineral damping,
+      this release collapses to zero above the dead moisture of extinction --
+      consistent with the spread model returning ``ROS = 0`` there.
+    * **WRF-SFIRE mass-loss** (default, ``reaction_intensity is None``): the
+      gross release is simply the consumed oven-dry load times the heat of
+      combustion. This counts the full fuel load regardless of whether the
+      flaming front can sustain itself, so it runs hotter than ``I_R`` -- by
+      ~2x for grass and up to ~10x for heavy litter -- and does *not* vanish
+      above the moisture of extinction.
 
     Parameters
     ----------
@@ -155,6 +172,9 @@ def compute_burnout(
     consumed_load : float               oven-dry load actually consumed
                                         [lb/ft^2]; defaults to the full fuel-bed
                                         load (all dead + live classes)
+    reaction_intensity : float          I_R [BTU/ft^2/min] from a SpreadResult;
+                                        when given, selects the I_R-consistent
+                                        energy basis (peak total flux == I_R)
     """
     # --- burnout time scale ---
     if t_f is not None:
@@ -185,8 +205,17 @@ def compute_burnout(
     # --- to SI and energy budget ---
     load_dry = consumed_load * LB_PER_FT2_TO_KG_PER_M2          # kg/m^2
     water_load = water * LB_PER_FT2_TO_KG_PER_M2                # kg/m^2
-    energy_gross = load_dry * HEAT_J_PER_KG                     # J/m^2
-    energy_latent = water_load * LATENT_HEAT_WATER             # J/m^2
+    if reaction_intensity is not None:
+        # I_R-consistent: heat per unit area = I_R * t_r (Byram), so the peak
+        # total flux E_gross / T_f reproduces the reaction intensity exactly.
+        energy_gross = reaction_intensity * IR_BTUFT2MIN_TO_WM2 * tf   # J/m^2
+        # the evaporative sink cannot exceed the heat the flame actually
+        # releases; above the moisture of extinction I_R (hence E_gross) is 0
+        energy_latent = min(water_load * LATENT_HEAT_WATER, energy_gross)
+    else:
+        # WRF-SFIRE mass-loss: full consumed load times heat of combustion
+        energy_gross = load_dry * HEAT_J_PER_KG                        # J/m^2
+        energy_latent = water_load * LATENT_HEAT_WATER                 # J/m^2
     energy_net = max(0.0, energy_gross - energy_latent)
     peak_flux = energy_net / tf if tf > 0 else 0.0
 
