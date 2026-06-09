@@ -88,7 +88,7 @@ class BurnoutResult:
     t_f: float            # e-folding burnout time                 [s]
     load_dry: float       # consumed oven-dry load                 [kg/m^2]
     water_load: float     # fuel moisture mass consumed            [kg/m^2]
-    energy_gross: float   # total chemical heat released           [J/m^2]
+    energy_gross: float   # total heat: sensible + latent          [J/m^2]
     energy_latent: float  # energy spent vaporising fuel moisture  [J/m^2]
     energy_net: float     # sensible heat delivered to atmosphere  [J/m^2]
     peak_flux: float      # sensible heat flux at t = t_i          [W/m^2]
@@ -145,11 +145,13 @@ def compute_burnout(
 
     Two energy bases are available for the flaming heat release per unit area:
 
-    * **I_R-consistent** (when ``reaction_intensity`` is given): the heat per
-      unit area is Byram's ``HPA = I_R * t_r``, so the peak total flux
-      ``E_gross / T_f`` is exactly the Rothermel reaction intensity ``I_R``.
-      Because ``I_R`` already carries Rothermel's moisture and mineral damping,
-      this release collapses to zero above the dead moisture of extinction --
+    * **I_R-consistent** (when ``reaction_intensity`` is given): ``I_R`` already
+      carries Rothermel's moisture and mineral damping, so it *is* the sensible
+      heat-release rate delivered to the atmosphere. The sensible energy per unit
+      area is Byram's ``E_sens = I_R * t_r``, making the peak sensible flux
+      ``E_net / T_f`` exactly ``I_R``; the fuel moisture leaves as an *additional*
+      latent flux on top, and the total is their sum (no double counting). Both
+      collapse to zero above the dead moisture of extinction (where ``I_R = 0``),
       consistent with the spread model returning ``ROS = 0`` there.
     * **WRF-SFIRE mass-loss** (default, ``reaction_intensity is None``): the
       gross release is simply the consumed oven-dry load times the heat of
@@ -206,17 +208,28 @@ def compute_burnout(
     load_dry = consumed_load * LB_PER_FT2_TO_KG_PER_M2          # kg/m^2
     water_load = water * LB_PER_FT2_TO_KG_PER_M2                # kg/m^2
     if reaction_intensity is not None:
-        # I_R-consistent: heat per unit area = I_R * t_r (Byram), so the peak
-        # total flux E_gross / T_f reproduces the reaction intensity exactly.
-        energy_gross = reaction_intensity * IR_BTUFT2MIN_TO_WM2 * tf   # J/m^2
-        # the evaporative sink cannot exceed the heat the flame actually
-        # releases; above the moisture of extinction I_R (hence E_gross) is 0
-        energy_latent = min(water_load * LATENT_HEAT_WATER, energy_gross)
+        # I_R-consistent: I_R already carries Rothermel's moisture and mineral
+        # damping, so it *is* the sensible heat-release rate. Byram's
+        # E_sens = I_R * t_r is the sensible energy per unit area.
+        energy_net = reaction_intensity * IR_BTUFT2MIN_TO_WM2 * tf     # sensible J/m^2
+        # The fuel water leaves as an additional latent flux on top. To stay
+        # energy-consistent it must scale with the heat actually released, so we
+        # apply the gross-chemistry split ratio (latent / sensible) to E_sens
+        # rather than a fixed offset: latent then vanishes together with I_R above
+        # the moisture of extinction, and total = sensible + latent.
+        chem_latent = water_load * LATENT_HEAT_WATER                  # full-load latent
+        chem_sensible = load_dry * HEAT_J_PER_KG - chem_latent        # full-load sensible
+        if chem_sensible > 0.0:
+            energy_latent = energy_net * chem_latent / chem_sensible
+        else:
+            energy_latent = 0.0      # water needs more heat than the fuel supplies
+        energy_gross = energy_net + energy_latent                     # total = sens + lat
     else:
-        # WRF-SFIRE mass-loss: full consumed load times heat of combustion
+        # WRF-SFIRE mass-loss: full consumed load times heat of combustion, with
+        # the evaporative sink subtracted to leave the sensible heat.
         energy_gross = load_dry * HEAT_J_PER_KG                        # J/m^2
         energy_latent = water_load * LATENT_HEAT_WATER                 # J/m^2
-    energy_net = max(0.0, energy_gross - energy_latent)
+        energy_net = max(0.0, energy_gross - energy_latent)
     peak_flux = energy_net / tf if tf > 0 else 0.0
 
     return BurnoutResult(
